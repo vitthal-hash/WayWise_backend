@@ -4,6 +4,7 @@ const helmet = require('helmet');
 
 const authRoutes = require('./routes/authRoutes');
 const syncRoutes = require('./routes/syncRoutes');
+const scheduledJourneyRoutes = require('./routes/scheduledJourneyRoutes');
 const { errorHandler } = require('./middleware/errorHandler');
 
 function createApp() {
@@ -17,6 +18,7 @@ function createApp() {
 
   app.use('/api/auth', authRoutes);
   app.use('/api/sync', syncRoutes);
+  app.use('/api/sync', scheduledJourneyRoutes);
 
   app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
   app.use(errorHandler);
