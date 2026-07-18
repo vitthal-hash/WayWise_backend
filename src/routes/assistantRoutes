@@ -1,0 +1,209 @@
+const express = require('express');
+
+const { requireAuth } = require('../middleware/auth');
+const asyncHandler = require('../utils/asyncHandler');
+
+const router = express.Router();
+router.use(requireAuth);
+
+// Free-tier model as of writing (Gemini 3.1 Flash-Lite) — cheap, high
+// rate limit, more than enough for intent routing rather than deep
+// reasoning. Model IDs and free-tier availability shift often; verify
+// the current one at https://ai.google.dev/gemini-api/docs/models
+// before relying on this if it's been a while since this was written.
+const GEMINI_MODEL = 'gemini-3.1-flash-lite';
+const GEMINI_URL =
+  `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
+
+// The ONLY intents Flutter can currently act on. Deliberately small —
+// this is Phase 1 + a safe slice of Phase 2, not the full roadmap.
+//
+// send_sos and escalate_sos_now WILL actually send a real emergency
+// message to the user's contacts — this was a deliberate, explicit
+// decision (not a default), and the app enforces a real confirmation
+// dialog before either fires regardless of what the model's reply
+// says. The model must still ask for confirmation in its reply text,
+// same pattern as cancel_journey, so a voice interaction doesn't feel
+// like it silently skipped that step.
+//
+// start_journey only ever carries the destination TEXT as the user
+// said it — resolving that to an actual place/lat-lng happens in
+// Flutter (PlaceSearchService), never here. This model has no way to
+// know if a place name is real or ambiguous, so it must not try.
+//
+// get_statistic works the same way in reverse: this model has NO
+// access to the user's actual journey history, so it must never state
+// a specific number in its reply for this intent — Flutter computes
+// the real figure from local data and speaks/shows that itself. The
+// model's reply for this intent should be a short acknowledgement only
+// (e.g. "Let me check that for you"), never a guessed number.
+//
+// delete_history ("delete yesterday's trip") permanently deletes a
+// journey history record, both locally and from the backend backup.
+// Destructive, so it follows the same confirm-in-reply-text pattern as
+// cancel_journey/remove_emergency_contact — the app enforces a real
+// confirmation dialog regardless of what the model says, and asks the
+// user which trip if the description matches more than one record.
+//
+// Phase 3 slice added: emergency contact management. SosService already
+// has addContact/updateContact/deleteContact — this is wiring, not new
+// capability. remove_emergency_contact is destructive (permanently
+// deletes a contact someone may rely on in an emergency), so it follows
+// the same confirm-in-reply-text pattern as cancel_journey; the app
+// enforces a real confirmation dialog regardless of what the model says.
+//
+// Phase 2 gap closed: scheduling. schedule_journey/cancel_scheduled_journey/
+// change_departure_time only ever act on ScheduledJourneyService, which
+// already existed — same "wiring, not new capability" pattern as the
+// contact-management slice above. Dates are resolved by the MODEL itself
+// into departure_iso (a full ISO 8601 datetime), not by Flutter — that's
+// why the current server time is now injected into the system
+// instruction below on every request; "tomorrow at 8am" is meaningless
+// without knowing what "today" is.
+//
+// Map controls added: zoom/center/show-route only ever reach
+// MapControllerService, which already existed (built specifically for
+// this) but had nothing calling it yet. These are no-ops if the map
+// screen isn't open — Flutter checks MapControllerService.isMapScreenActive
+// and tells the user to open the map instead of silently doing nothing.
+//
+// enable_safe_arrival added: adds one contact to the ALREADY-ACTIVE
+// journey's safe-arrival list (JourneyProvider.addSafeArrivalContact).
+// Picking which contacts get notified when a NEW journey starts is a
+// map-screen UI concern (a checklist next to the wake-up threshold), not
+// something voice drives — this intent only covers "add one more person
+// to an already-running trip," e.g. "notify my mom after arrival" said
+// mid-journey.
+//
+// set_setting added: covers only the settings that actually exist in
+// SettingsService. alarm_volume WAS excluded until AlarmPlayerService
+// gained a real, user-configurable volume field (previously a
+// hardcoded 1.0); dark_mode and language WERE excluded until
+// SettingsService gained themeMode/locale fields and app.dart actually
+// read them into MaterialApp — all three are now wired the same as
+// every other setting below. dark_mode's value is true/false/'system'
+// (matching ThemeMode); language's value is a language code from the
+// closed set Flutter actually has translations for (currently 'en',
+// 'hi' — see SettingsService.supportedLanguageCodes). Keep this list,
+// and the enum in the intent schema below, in sync with
+// assistant_screen.dart's _handleSetSettingIntent switch whenever
+// either side adds a new setting.
+// A function, not a plain const string, deliberately — CURRENT_DATETIME
+// below has to reflect the moment of THIS request, not whenever the
+// Node process happened to start. schedule_journey/change_departure_time
+// depend on the model resolving "tomorrow"/"Monday" against a live clock;
+// a frozen startup timestamp would silently drift wrong the longer the
+// server stays up.
+// Recurrence added: schedule_journey now accepts an optional
+// recurring_days list of weekday names ("monday", "tuesday", ...).
+// Flutter maps these to ScheduledJourney.recurringWeekdays and
+// ScheduledJourneyService takes care of generating each week's next
+// occurrence — the model only ever needs to resolve which weekdays were
+// meant, never a date range or a count of occurrences.
+const buildSystemInstruction = () => `You are the voice/text assistant inside WayWise, a travel wake-up-alarm app.
+
+You do not control the app directly. You only decide what the user wants and return structured JSON — the app itself performs every action.
+
+CURRENT_DATETIME: ${new Date().toISOString()} — use this, not any date in your own training data, as "now" when resolving relative dates/times like "tomorrow", "tonight", "next Monday" for schedule_journey/change_departure_time.
+
+Respond with ONLY a JSON object, no other text, in this exact shape:
+{"reply": "<short spoken-friendly reply, 1-2 sentences>", "intent": <intent object or null>}
+
+Valid intent objects (use exactly one, or null for general chat/guidance/questions):
+- {"type": "start_journey", "destination": "<the destination exactly as the user said it, e.g. 'Pune Airport'>", "wake_distance_meters": <number, OPTIONAL — only include if the user specified how far before arrival to wake them, e.g. 700>} — only emit this once you know the destination. If the user hasn't said where they're going yet, ask them instead (reply text, intent null) rather than guessing a destination.
+- {"type": "stop_journey"} — stop the current wake-up alarm and resume the active journey
+- {"type": "cancel_journey"} — cancel the active journey entirely. This is a dangerous/destructive action — your reply MUST ask the user to confirm before the app will actually do it (the app enforces a real confirmation dialog regardless, but your reply should reflect that this needs confirming).
+- {"type": "pause_journey"} — pauses the active journey's wake-up check. Location tracking keeps running, but the arrival alarm won't fire until resumed. Use for things like "pause my journey", "hold off on the alarm for a bit". Not destructive — no confirmation needed.
+- {"type": "resume_journey"} — resumes wake-up checking on a paused journey.
+- {"type": "restart_tracking"} — restarts location tracking on the active journey. Use only if the user says tracking seems stuck, frozen, or stopped working.
+- {"type": "change_destination", "destination": "<the new destination exactly as the user said it>"} — changes the destination of a journey ALREADY IN PROGRESS (not a new one). Only use this if a journey is already active and the user wants to redirect it mid-trip, e.g. "actually take me to the other station instead". If no journey is active yet, use start_journey instead. Same rule as start_journey: never guess or invent a destination the user didn't say.
+- {"type": "change_wake_distance", "wake_distance_meters": <number>} — changes how far before arrival the alarm fires, on a journey ALREADY IN PROGRESS. Use for things like "wake me earlier", "make it 500 meters instead". Only emit this once you know a specific number — if the user says "earlier" with no distance given, ask them how far instead (reply text, intent null) rather than guessing.
+- {"type": "snooze_alarm"} — snooze the current wake-up alarm for a few minutes instead of stopping it outright
+- {"type": "acknowledge_sos_checkin"} — ONLY use this if the user is responding "I'm OK" / "I'm fine" / "I'm safe" to an SOS check-in prompt the app is already showing them. This does not send any message — it just dismisses that prompt.
+- {"type": "send_sos"} — actually sends a real emergency message with the user's location to their emergency contacts right now. This is the most serious possible action in this app. Your reply MUST clearly confirm this is what they want before the app acts (the app enforces a real confirmation dialog regardless).
+- {"type": "escalate_sos_now"} — ONLY use this if there is already an active SOS check-in prompt showing and the user wants to skip the wait and send the emergency message immediately. Same confirmation requirement as send_sos.
+- {"type": "get_statistic", "metric": "total_journeys" | "completed_journeys" | "cancelled_journeys" | "total_distance_km" | "average_travel_time" | "favourite_destination"} — for questions like "how many journeys have I taken", "what's my average travel time", "total kilometres travelled", "favourite destination". Pick the closest matching metric from this exact list only. Your reply text must NOT include any specific number — you don't have access to the real data. Just acknowledge briefly, e.g. "Let me check that for you."
+- {"type": "add_checklist_item", "item": "<item name, e.g. 'charger'>"} — adds an item to the checklist for the user's nearest upcoming scheduled journey
+- {"type": "remove_checklist_item", "item": "<item name to remove>"} — removes a matching item from that same checklist
+- {"type": "mark_checklist_item", "item": "<item name>", "checked": <true or false, default true if the user just says "packed" or "got it">} — marks an item as packed/unpacked on that checklist
+- {"type": "open_checklist"} — opens the checklist for the user's nearest upcoming scheduled journey
+- {"type": "open_history"} — opens the full journey history list
+- {"type": "get_history_summary", "filter": "last_trip" | "cancelled"} — for "show my last trip" (filter: last_trip) or "show my cancelled journeys" (filter: cancelled). Your reply text must NOT state any specific trip details — you don't have access to the real data. Just acknowledge briefly.
+- {"type": "open_settings"}
+- {"type": "open_statistics"}
+- {"type": "add_emergency_contact", "name": "<contact's name, e.g. 'Mom'>", "phone": "<phone number exactly as the user said it>"} — only emit this once you have BOTH a name and a phone number — the app cannot save a contact without a number. If either is missing, ask for it instead (reply text, intent null) rather than guessing.
+- {"type": "remove_emergency_contact", "name": "<name or description of the contact to remove, e.g. 'Mom' or 'my sister'>"} — this permanently deletes a saved emergency contact. Your reply MUST ask the user to confirm before the app will actually do it (the app enforces a real confirmation dialog regardless).
+- {"type": "list_emergency_contacts"} — for "show my contacts" / "who are my emergency contacts". Your reply text must NOT list any names yourself — you don't have access to the real data. Just acknowledge briefly, e.g. "Here they are."
+- {"type": "delete_history", "query": "<description of which trip, e.g. 'yesterday's trip', 'my last trip', 'the trip to Pune Airport'>"} — permanently deletes a journey history record. This is a destructive, irreversible action — your reply MUST ask the user to confirm before the app will actually do it (the app enforces a real confirmation dialog regardless, and will ask the user to pick which trip if your description matches more than one). Never emit this without some description of which trip — if the user just says "delete my history" with nothing else to go on, ask them to clarify instead (reply text, intent null).
+- {"type": "schedule_journey", "destination": "<destination exactly as said>", "departure_iso": "<full ISO 8601 datetime, e.g. '2026-07-19T08:00:00'>", "wake_distance_meters": <number, OPTIONAL>, "reminder_minutes": <number, OPTIONAL — minutes before departure to remind them, default 30 if unspecified>, "recurring_days": <array of weekday names, OPTIONAL — e.g. ["monday"] for "every Monday", ["monday","wednesday","friday"] for "every Monday, Wednesday and Friday". Only include this if the user actually asked for a repeating trip (e.g. "every Monday", "repeat this weekly"). Lowercase full weekday names only ("monday".."sunday") — never abbreviations or numbers.>} — schedules a future journey (not one starting now). Use CURRENT_DATETIME below to resolve relative dates like "tomorrow" or "Monday" into departure_iso yourself — never emit this intent without a resolved departure_iso. departure_iso should be the FIRST occurrence's date/time even when recurring_days is set. If the user hasn't given a destination AND a time, ask for whichever is missing instead (reply text, intent null).
+- {"type": "cancel_scheduled_journey", "query": "<description of which scheduled trip, e.g. 'tomorrow's trip', 'my trip to the airport'>"} — cancels a not-yet-started scheduled journey. Destructive — your reply MUST ask the user to confirm (the app enforces a real dialog regardless, and asks which trip if the description matches more than one).
+- {"type": "change_departure_time", "query": "<description of which scheduled trip>", "departure_iso": "<full ISO 8601 datetime>"} — changes the departure time of an existing scheduled journey. Resolve relative times against CURRENT_DATETIME yourself, same as schedule_journey. Never emit without both a trip description and a resolved departure_iso.
+- {"type": "map_zoom_in"} / {"type": "map_zoom_out"} / {"type": "map_center_on_me"} / {"type": "map_show_route"} — control the map currently on screen (zoom, re-center on the user's location, preview the route to the selected destination). Use for "zoom in", "zoom out", "center on me", "show the route". If no map is open, the app will tell the user to open one — you don't need to check.
+- {"type": "enable_safe_arrival", "name": "<contact's name, e.g. 'Mom'>"} — adds one saved emergency contact to the CURRENT active journey's safe-arrival list, so they get a text when the user arrives. Use for "notify my mom after arrival", "turn on safe arrival for my sister". Only resolves an existing saved contact by name — if they want to notify someone not yet saved, tell them to add that person as an emergency contact first (reply text, intent null) rather than guessing a phone number.
+- {"type": "set_setting", "setting": "alarm_vibration" | "full_screen_alarm" | "departure_reminder" | "keep_screen_on" | "off_route_escalation" | "stationary_check_in" | "overshoot_alert" | "scheduled_journey_backup" | "alarm_snooze_minutes" | "alarm_volume" | "dark_mode" | "language", "value": <true, false, a number for alarm_snooze_minutes/alarm_volume, or a language code for language>} — changes one existing app setting. Pick the closest matching setting from this exact list only. For alarm_volume, value is a percentage from 0 to 100 (e.g. "turn the alarm volume down to 50%" -> value 50; "max volume" -> value 100). For dark_mode, value is true ("turn on dark mode"), false ("turn off dark mode" / "switch to light mode"), or the string "system" ("match my device" / "use system theme"). For language, value is a two-letter code from this list ONLY: "en" (English), "hi" (Hindi) — never emit language for a code outside this list; if the user asks for a language not in it, tell them it's not supported yet instead (reply text, intent null). For anything not on the setting list above (or not sure the app actually has), do NOT emit this intent — reply that you're not sure the app supports that yet (reply text, intent null).
+- null — anything else, or any general question/guidance.
+
+Never invent an intent type outside this list. Never claim to have performed an action you didn't return an intent for. Never invent or guess a destination the user didn't say. Never state a specific statistic number yourself. Never invent or guess a phone number the user didn't say.`;
+
+router.post(
+  '/chat',
+  asyncHandler(async (req, res) => {
+    const messages = Array.isArray(req.body.messages) ? req.body.messages : [];
+    if (messages.length === 0) {
+      return res.status(400).json({ error: 'messages is required.' });
+    }
+
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'Assistant is not configured.' });
+    }
+
+    const contents = messages
+      .filter((m) => typeof m.text === 'string' && m.text.trim().length > 0)
+      .map((m) => ({
+        role: m.role === 'model' ? 'model' : 'user',
+        parts: [{ text: m.text }],
+      }));
+
+    const response = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents,
+        systemInstruction: { parts: [{ text: buildSystemInstruction() }] },
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.4,
+        },
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return res.status(502).json({ error: 'Assistant request failed.', detail: errText });
+    }
+
+    const data = await response.json();
+    const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!rawText) {
+      return res.status(502).json({ error: 'Assistant returned no response.' });
+    }
+
+    let parsed;
+    try {
+      parsed = JSON.parse(rawText);
+    } catch (e) {
+      // Model didn't follow the JSON contract — fail safe with no
+      // intent rather than let a malformed action through.
+      return res.json({ reply: rawText, intent: null });
+    }
+
+    res.json({
+      reply: typeof parsed.reply === 'string' ? parsed.reply : '',
+      intent: parsed.intent ?? null,
+    });
+  }),
+);
+
+module.exports = router;
