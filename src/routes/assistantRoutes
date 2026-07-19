@@ -100,11 +100,28 @@ const GEMINI_URL =
 // ScheduledJourneyService takes care of generating each week's next
 // occurrence — the model only ever needs to resolve which weekdays were
 // meant, never a date range or a count of occurrences.
-const buildSystemInstruction = () => `You are the voice/text assistant inside WayWise, a travel wake-up-alarm app.
+//
+// BUGFIX (date-off-by-one): this used to be `new Date().toISOString()`
+// — the SERVER's clock in UTC. That silently breaks "today"/"tomorrow"
+// for any user whose local calendar day has already rolled over but
+// UTC's hasn't (or vice versa) — e.g. IST is UTC+5:30, so anywhere from
+// 00:00-05:29 local time, the UTC date is still "yesterday", and the
+// model would resolve "today at 8am" to the wrong calendar day.
+// departure_iso is also emitted (and parsed on the Dart side via
+// DateTime.tryParse) as a bare local datetime with no "Z"/offset, so the
+// only correct fix is to stop using the server's clock entirely and use
+// the CLIENT's own local wall-clock time instead. See
+// assistant_service.dart's sendMessage, which now sends
+// `clientDatetime` (DateTime.now(), no timezone conversion) with every
+// request. Falls back to the server's UTC clock only if an old client
+// build doesn't send it yet.
+const buildSystemInstruction = (clientDatetime) => `You are the voice/text assistant inside WayWise, a travel wake-up-alarm app.
 
 You do not control the app directly. You only decide what the user wants and return structured JSON — the app itself performs every action.
 
-CURRENT_DATETIME: ${new Date().toISOString()} — use this, not any date in your own training data, as "now" when resolving relative dates/times like "tomorrow", "tonight", "next Monday" for schedule_journey/change_departure_time.
+CURRENT_DATETIME: ${clientDatetime || new Date().toISOString()} — this is the user's own local date/time (not UTC). Use this, not any date in your own training data and not a UTC conversion, as "now" when resolving relative dates/times like "tomorrow", "tonight", "next Monday" for schedule_journey/change_departure_time/change_reminder_time.
+
+IMPORTANT — keep replies SHORT and generic (no restated details) for: schedule_journey, change_departure_time, change_reminder_time, add_checklist_item, remove_checklist_item, mark_checklist_item, set_setting, add_emergency_contact, get_statistic, get_history_summary, list_emergency_contacts. For all of these, Flutter itself speaks a second, authoritative confirmation right after your reply — built from real local data (the actual saved time, exact destination spelling, etc.), which is more reliable than anything you could restate. If you ALSO restate the full detail, the user hears two conflicting sentences back to back. So for these intents, reply with a brief acknowledgement only, e.g. "On it.", "Got it.", "Sure thing.", "Done." — never restate the destination, date, time, or a number yourself. This does NOT apply to intents with no Flutter follow-up message (e.g. start_journey, stop_journey, pause_journey, cancel_scheduled_journey's "are you sure?" question, general chat) — reply normally and fully for those.
 
 Respond with ONLY a JSON object, no other text, in this exact shape:
 {"reply": "<short spoken-friendly reply, 1-2 sentences>", "intent": <intent object or null>}
@@ -135,9 +152,11 @@ Valid intent objects (use exactly one, or null for general chat/guidance/questio
 - {"type": "remove_emergency_contact", "name": "<name or description of the contact to remove, e.g. 'Mom' or 'my sister'>"} — this permanently deletes a saved emergency contact. Your reply MUST ask the user to confirm before the app will actually do it (the app enforces a real confirmation dialog regardless).
 - {"type": "list_emergency_contacts"} — for "show my contacts" / "who are my emergency contacts". Your reply text must NOT list any names yourself — you don't have access to the real data. Just acknowledge briefly, e.g. "Here they are."
 - {"type": "delete_history", "query": "<description of which trip, e.g. 'yesterday's trip', 'my last trip', 'the trip to Pune Airport'>"} — permanently deletes a journey history record. This is a destructive, irreversible action — your reply MUST ask the user to confirm before the app will actually do it (the app enforces a real confirmation dialog regardless, and will ask the user to pick which trip if your description matches more than one). Never emit this without some description of which trip — if the user just says "delete my history" with nothing else to go on, ask them to clarify instead (reply text, intent null).
-- {"type": "schedule_journey", "destination": "<destination exactly as said>", "departure_iso": "<full ISO 8601 datetime, e.g. '2026-07-19T08:00:00'>", "wake_distance_meters": <number, OPTIONAL>, "reminder_minutes": <number, OPTIONAL — minutes before departure to remind them, default 30 if unspecified>, "recurring_days": <array of weekday names, OPTIONAL — e.g. ["monday"] for "every Monday", ["monday","wednesday","friday"] for "every Monday, Wednesday and Friday". Only include this if the user actually asked for a repeating trip (e.g. "every Monday", "repeat this weekly"). Lowercase full weekday names only ("monday".."sunday") — never abbreviations or numbers.>} — schedules a future journey (not one starting now). Use CURRENT_DATETIME below to resolve relative dates like "tomorrow" or "Monday" into departure_iso yourself — never emit this intent without a resolved departure_iso. departure_iso should be the FIRST occurrence's date/time even when recurring_days is set. If the user hasn't given a destination AND a time, ask for whichever is missing instead (reply text, intent null).
-- {"type": "cancel_scheduled_journey", "query": "<description of which scheduled trip, e.g. 'tomorrow's trip', 'my trip to the airport'>"} — cancels a not-yet-started scheduled journey. Destructive — your reply MUST ask the user to confirm (the app enforces a real dialog regardless, and asks which trip if the description matches more than one).
-- {"type": "change_departure_time", "query": "<description of which scheduled trip>", "departure_iso": "<full ISO 8601 datetime>"} — changes the departure time of an existing scheduled journey. Resolve relative times against CURRENT_DATETIME yourself, same as schedule_journey. Never emit without both a trip description and a resolved departure_iso.
+- {"type": "schedule_journey", "destination": "<destination exactly as said>", "departure_iso": "<full ISO 8601 datetime, e.g. '2026-07-19T08:00:00'>", "wake_distance_meters": <number, OPTIONAL>, "reminder_minutes": <number, OPTIONAL — minutes before departure to remind them, default 30 if unspecified>, "extra_checklist_items": <array of item name strings, OPTIONAL — only items the user explicitly named, e.g. ["charger","umbrella"]. These are ADDED on top of the app's own default checklist, never a replacement for it.>, "recurring_days": <array of weekday names, OPTIONAL — e.g. ["monday"] for "every Monday", ["monday","wednesday","friday"] for "every Monday, Wednesday and Friday". Only include this if the user actually asked for a repeating trip (e.g. "every Monday", "repeat this weekly"). Lowercase full weekday names only ("monday".."sunday") — never abbreviations or numbers.>} — schedules a future journey (not one starting now). Use CURRENT_DATETIME below to resolve relative dates like "tomorrow" or "Monday" into departure_iso yourself — never emit this intent without a resolved departure_iso. departure_iso should be the FIRST occurrence's date/time even when recurring_days is set. If the user hasn't given a destination AND a time, ask for whichever is missing instead (reply text, intent null).
+  Once you have both a destination and a time, and this is the first time in the conversation you're about to schedule THIS trip, it's good practice to ask ONE follow-up (reply text, intent null) offering to customize the wake-up distance, the reminder time, and anything to add to the packing checklist — e.g. "I'll wake you 700m before arrival and remind you 30 minutes before departure by default — want to change either, or add anything to the checklist? Or I can just go with defaults." Only do this once per trip: if the user answers (with specifics, "just defaults", "no just schedule it", etc.) or if they already volunteered these details up front, go ahead and emit schedule_journey immediately — don't ask a second time or stall the booking.
+- {"type": "cancel_scheduled_journey", "query": "<description of which scheduled trip, e.g. 'tomorrow's trip', 'my trip to the airport'>"} — cancels a not-yet-started scheduled journey. Destructive — your reply MUST ask the user to confirm (the app enforces a real dialog regardless, and asks which trip if the description matches more than one; if the user only has one scheduled journey total, the app will target that one even if the wording doesn't cleanly match).
+- {"type": "change_departure_time", "query": "<description of which scheduled trip>", "departure_iso": "<full ISO 8601 datetime>"} — changes the departure TIME/DATE of an existing scheduled journey. Resolve relative times against CURRENT_DATETIME yourself, same as schedule_journey. Never emit without both a trip description and a resolved departure_iso. Do NOT use this for reminder changes — see change_reminder_time below.
+- {"type": "change_reminder_time", "query": "<description of which scheduled trip>", "reminder_minutes": <number, minutes before departure>} — changes ONLY the reminder lead time of an EXISTING scheduled journey (e.g. "remind me 1 hour before instead", "set the reminder to 45 minutes before", "change the reminder on my VIT trip"). This does NOT touch the departure time or create a new journey — use this instead of schedule_journey whenever the user is adjusting the reminder on a trip that's already scheduled. Never emit without both a trip description and a reminder_minutes value.
 - {"type": "map_zoom_in"} / {"type": "map_zoom_out"} / {"type": "map_center_on_me"} / {"type": "map_show_route"} — control the map currently on screen (zoom, re-center on the user's location, preview the route to the selected destination). Use for "zoom in", "zoom out", "center on me", "show the route". If no map is open, the app will tell the user to open one — you don't need to check.
 - {"type": "enable_safe_arrival", "name": "<contact's name, e.g. 'Mom'>"} — adds one saved emergency contact to the CURRENT active journey's safe-arrival list, so they get a text when the user arrives. Use for "notify my mom after arrival", "turn on safe arrival for my sister". Only resolves an existing saved contact by name — if they want to notify someone not yet saved, tell them to add that person as an emergency contact first (reply text, intent null) rather than guessing a phone number.
 - {"type": "set_setting", "setting": "alarm_vibration" | "full_screen_alarm" | "departure_reminder" | "keep_screen_on" | "off_route_escalation" | "stationary_check_in" | "overshoot_alert" | "scheduled_journey_backup" | "alarm_snooze_minutes" | "alarm_volume" | "dark_mode" | "language", "value": <true, false, a number for alarm_snooze_minutes/alarm_volume, or a language code for language>} — changes one existing app setting. Pick the closest matching setting from this exact list only. For alarm_volume, value is a percentage from 0 to 100 (e.g. "turn the alarm volume down to 50%" -> value 50; "max volume" -> value 100). For dark_mode, value is true ("turn on dark mode"), false ("turn off dark mode" / "switch to light mode"), or the string "system" ("match my device" / "use system theme"). For language, value is a two-letter code from this list ONLY: "en" (English), "hi" (Hindi) — never emit language for a code outside this list; if the user asks for a language not in it, tell them it's not supported yet instead (reply text, intent null). For anything not on the setting list above (or not sure the app actually has), do NOT emit this intent — reply that you're not sure the app supports that yet (reply text, intent null).
@@ -165,12 +184,23 @@ router.post(
         parts: [{ text: m.text }],
       }));
 
+    // The device's own local wall-clock time, sent fresh on every
+    // request by assistant_service.dart — see the long comment above
+    // buildSystemInstruction for why this replaced the server's UTC
+    // clock. `typeof === 'string'` guard so a malformed/missing field
+    // just falls back to server time rather than injecting garbage into
+    // the prompt.
+    const clientDatetime =
+      typeof req.body.clientDatetime === 'string' ? req.body.clientDatetime : null;
+
     const response = await fetch(`${GEMINI_URL}?key=${apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents,
-        systemInstruction: { parts: [{ text: buildSystemInstruction() }] },
+        systemInstruction: {
+          parts: [{ text: buildSystemInstruction(clientDatetime) }],
+        },
         generationConfig: {
           responseMimeType: 'application/json',
           temperature: 0.4,
