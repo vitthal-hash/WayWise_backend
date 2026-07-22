@@ -200,7 +200,7 @@ npm start
 
 # 🌐 Deployment
 
-The backend is deployed on **Render**.
+Hosted on Render with MongoDB Atlas as the cloud database.
 
 ## 🌐 Live API
 
